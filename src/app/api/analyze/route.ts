@@ -14,10 +14,9 @@ const CANDIDATE_MODELS = [
 
 export async function POST(request: Request) {
   try {
-    const authHeaderKey = request.headers.get('x-gemini-api-key');
-    const apiKey = (process.env.GEMINI_API_KEY || authHeaderKey || '').trim();
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
 
-    // 1. Strictly verify API Key presence
+    // 1. Strictly verify server-side API Key presence
     if (!apiKey) {
       return NextResponse.json(
         {
@@ -25,9 +24,12 @@ export async function POST(request: Request) {
           code: 'API_KEY_NOT_CONFIGURED',
           error: 'Gemini API key is not configured.',
           message:
-            'AI analysis cannot run because GEMINI_API_KEY is not set. Please add GEMINI_API_KEY to your .env.local file.',
+            'AI analysis cannot run because GEMINI_API_KEY is not configured on the server. Please add GEMINI_API_KEY to your Vercel Project Settings or local .env.local file.',
         },
-        { status: 400 }
+        {
+          status: 400,
+          headers: { 'Cache-Control': 'no-store' },
+        }
       );
     }
 

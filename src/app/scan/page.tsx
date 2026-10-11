@@ -18,8 +18,6 @@ import {
   Info,
   Check,
   BarChart3,
-  ChevronDown,
-  ChevronUp,
   ShieldCheck,
   Cloud
 } from 'lucide-react';
@@ -38,9 +36,7 @@ export default function ScannerPage() {
   
   // API & Analysis State
   const [apiStatus, setApiStatus] = useState<ApiStatusResponse | null>(null);
-  const [checkingApi, setCheckingApi] = useState(false);
-  const [sessionApiKey, setSessionApiKey] = useState('');
-  const [showKeyInput, setShowKeyInput] = useState(false);
+  const [checkingApi, setCheckingApi] = useState(true);
   
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<WasteAnalysisResult | null>(null);
@@ -49,42 +45,47 @@ export default function ScannerPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const checkBackendApiStatus = useCallback(async (customKey?: string) => {
+  const checkBackendApiStatus = useCallback(async () => {
     setCheckingApi(true);
     try {
-      const headers: Record<string, string> = {};
-      const keyToTest = customKey !== undefined ? customKey : sessionApiKey;
-      if (keyToTest.trim()) {
-        headers['x-gemini-api-key'] = keyToTest.trim();
+      const res = await fetch('/api/status', {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      if (res.ok) {
+        const data: ApiStatusResponse = await res.json();
+        setApiStatus(data);
       }
-      const res = await fetch('/api/status', { headers });
-      const data: ApiStatusResponse = await res.json();
-      setApiStatus(data);
     } catch (err: unknown) {
       console.error('Failed to check API status:', err);
     } finally {
       setCheckingApi(false);
     }
-  }, [sessionApiKey]);
+  }, []);
 
   // Check API status on mount asynchronously
   useEffect(() => {
     let isMounted = true;
-    const headers: Record<string, string> = {};
-    if (sessionApiKey.trim()) {
-      headers['x-gemini-api-key'] = sessionApiKey.trim();
-    }
-    fetch('/api/status', { headers })
-      .then((res) => res.json())
+    fetch('/api/status', {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
       .then((data: ApiStatusResponse) => {
         if (isMounted) setApiStatus(data);
       })
-      .catch((err) => console.error('Failed to check API status on mount:', err));
+      .catch((err) => console.error('Failed to check API status on mount:', err))
+      .finally(() => {
+        if (isMounted) setCheckingApi(false);
+      });
 
     return () => {
       isMounted = false;
     };
-  }, [sessionApiKey]);
+  }, []);
 
   // Handle file selection
   const handleFile = (file: File) => {
@@ -176,16 +177,11 @@ export default function ScannerPage() {
     setSaveError(null);
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (sessionApiKey.trim()) {
-        headers['x-gemini-api-key'] = sessionApiKey.trim();
-      }
-
       const res = await fetch('/api/analyze', {
         method: 'POST',
-        headers,
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           image: selectedImage,
           mimeType: imageMeta?.type || 'image/jpeg',
@@ -307,7 +303,7 @@ export default function ScannerPage() {
     }
   };
 
-  const isConfigured = Boolean(apiStatus?.configured || sessionApiKey.trim().length > 0);
+  const isAiConfigured = Boolean(apiStatus?.configured);
 
   return (
     <div className="min-h-screen py-10 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto">
@@ -325,9 +321,28 @@ export default function ScannerPage() {
         </p>
       </div>
 
-      {/* Honest API Status Indicator & Setup Banner */}
+      {/* Honest API Status Indicator */}
       <div className="mb-8">
-        {!isConfigured ? (
+        {checkingApi && apiStatus === null ? (
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4 shadow-xs flex items-center justify-between animate-pulse">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-slate-200 text-slate-600">
+                <RefreshCw className="w-5 h-5 animate-spin" />
+              </div>
+              <div>
+                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  Connecting to AI Engine...
+                </span>
+                <p className="text-[11px] text-slate-500">
+                  Checking server configuration for Google Gemini Vision API...
+                </p>
+              </div>
+            </div>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-slate-200 text-slate-700">
+              Verifying...
+            </span>
+          </div>
+        ) : !isAiConfigured ? (
           <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-5 shadow-xs">
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
               <div className="flex items-start gap-3">
@@ -342,7 +357,7 @@ export default function ScannerPage() {
                     </span>
                   </h3>
                   <p className="text-xs text-amber-700 mt-1 leading-relaxed">
-                    Image preview and file selection are fully functional. To run live AI classifications without faking responses, configure <code className="bg-amber-100/90 px-1.5 py-0.5 rounded font-mono text-amber-900">GEMINI_API_KEY</code> in your <code className="bg-amber-100/90 px-1.5 py-0.5 rounded font-mono text-amber-900">.env.local</code> file, or provide a session key below.
+                    Image preview and file selection are fully functional. To enable live AI classifications, configure <code className="bg-amber-100/90 px-1.5 py-0.5 rounded font-mono text-amber-900">GEMINI_API_KEY</code> in your Vercel Project Settings (Environment Variables) or local <code className="bg-amber-100/90 px-1.5 py-0.5 rounded font-mono text-amber-900">.env.local</code> file.
                   </p>
                 </div>
               </div>
@@ -350,55 +365,16 @@ export default function ScannerPage() {
               <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
                 <button
                   type="button"
-                  onClick={() => setShowKeyInput(!showKeyInput)}
-                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-white border border-amber-300 text-xs font-semibold text-amber-900 hover:bg-amber-100/50 transition-colors"
-                >
-                  <Key className="w-3.5 h-3.5" />
-                  <span>{showKeyInput ? 'Hide Key Setup' : 'Quick Key Setup'}</span>
-                  {showKeyInput ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-                </button>
-                <button
-                  type="button"
                   onClick={() => checkBackendApiStatus()}
                   disabled={checkingApi}
-                  className="p-2 rounded-lg bg-white border border-amber-300 text-amber-900 hover:bg-amber-100/50 transition-colors"
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-white border border-amber-300 text-xs font-semibold text-amber-900 hover:bg-amber-100/50 transition-colors shadow-xs"
                   title="Refresh API Status"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${checkingApi ? 'animate-spin' : ''}`} />
+                  <span>{checkingApi ? 'Checking...' : 'Refresh Status'}</span>
                 </button>
               </div>
             </div>
-
-            {/* Quick API Key Setup Panel */}
-            {showKeyInput && (
-              <div className="mt-4 pt-4 border-t border-amber-200/80 space-y-3">
-                <div className="text-xs text-amber-800 font-medium">
-                  Option 1: Add into project <code className="bg-white px-1.5 py-0.5 rounded border border-amber-300 font-mono">.env.local</code>:
-                </div>
-                <div className="bg-slate-900 text-slate-200 font-mono text-xs p-3 rounded-lg overflow-x-auto select-all">
-                  GEMINI_API_KEY=your_gemini_api_key_here
-                </div>
-                <div className="text-xs text-amber-800 font-medium pt-1">
-                  Option 2: Enter browser session key for immediate testing:
-                </div>
-                <div className="flex gap-2">
-                  <input
-                    type="password"
-                    placeholder="AIzaSy..."
-                    value={sessionApiKey}
-                    onChange={(e) => setSessionApiKey(e.target.value)}
-                    className="flex-1 px-3 py-2 text-xs rounded-lg border border-amber-300 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => checkBackendApiStatus(sessionApiKey)}
-                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-colors"
-                  >
-                    Apply Key
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
         ) : (
           <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 shadow-xs flex items-center justify-between">
