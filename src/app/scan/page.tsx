@@ -25,6 +25,7 @@ import {
 import { WasteAnalysisResult, ApiStatusResponse, AnalysisApiResponse, UploadApiResponse } from '@/types';
 import { saveScanRecord } from '@/lib/storage';
 import { SAMPLE_WASTE_ITEMS, SampleWasteItem } from '@/lib/sampleImages';
+import { compressImageForAnalysis } from '@/lib/imageCompression';
 
 export default function ScannerPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -199,18 +200,83 @@ export default function ScannerPage() {
     setSaveError(null);
 
     try {
+      // 1. Client-side image compression to prevent Vercel 4.5MB Serverless Function payload rejection (HTTP 413)
+      let payloadImage = selectedImage;
+      let payloadMime = imageMeta?.type || 'image/jpeg';
+
+      if (selectedImage.startsWith('data:image/')) {
+        try {
+          const compressed = await compressImageForAnalysis(selectedImage, {
+            maxDimension: 1600,
+            initialQuality: 0.85,
+            maxCharacterLength: 2.8 * 1024 * 1024, // ~2.8MB cap
+          });
+          if (compressed.dataUrl) {
+            payloadImage = compressed.dataUrl;
+            payloadMime = compressed.mimeType;
+          }
+        } catch (compressionErr) {
+          console.warn('Client-side compression skipped, sending original:', compressionErr);
+        }
+      }
+
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          image: selectedImage,
-          mimeType: imageMeta?.type || 'image/jpeg',
+          image: payloadImage,
+          mimeType: payloadMime,
         }),
       });
 
-      const responseData: AnalysisApiResponse = await res.json();
+      // 2. Read response as text first to safely inspect content before JSON parsing
+      const rawText = await res.text();
+      let responseData: AnalysisApiResponse | null = null;
+
+      try {
+        if (rawText && rawText.trim().length > 0) {
+          responseData = JSON.parse(rawText);
+        }
+      } catch (parseErr) {
+        console.warn('Non-JSON response from /api/analyze:', parseErr, rawText.slice(0, 120));
+      }
+
+      // Handle Vercel Edge / HTTP 413 (Request Entity Too Large)
+      if (
+        res.status === 413 ||
+        (!responseData && (rawText.includes('Request Entity Too Large') || rawText.includes('413')))
+      ) {
+        setAnalysisError({
+          code: 'PAYLOAD_TOO_LARGE',
+          message:
+            'Image payload exceeds the server transfer limit (HTTP 413 Request Entity Too Large). The image was compressed, but remains too large. Please select a smaller photo or test with a sample item.',
+        });
+        return;
+      }
+
+      // Handle Vercel Edge / HTTP 504 (Gateway Timeout)
+      if (
+        res.status === 504 ||
+        (!responseData && rawText.includes('FUNCTION_INVOCATION_TIMEOUT'))
+      ) {
+        setAnalysisError({
+          code: 'TIMEOUT',
+          message:
+            'AI vision analysis timed out on the server (HTTP 504). Please try again or test with a preset sample item.',
+        });
+        return;
+      }
+
+      // If response is not JSON and not handled above
+      if (!responseData) {
+        setAnalysisError({
+          code: 'SERVER_ERROR',
+          message: `The server returned an unexpected non-JSON response (HTTP ${res.status}). Please verify your connection or try again.`,
+        });
+        return;
+      }
 
       if (!res.ok || !responseData.success) {
         const is429 = res.status === 429 || responseData.code === 'QUOTA_EXCEEDED';
@@ -235,10 +301,16 @@ export default function ScannerPage() {
         setAnalysisResult(responseData.data);
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Network error occurred while contacting analysis service.';
+      const msg = err instanceof Error ? err.message : 'Network communication error';
+      // Sanitize raw JavaScript syntax errors if any leak through
+      const cleanMsg =
+        msg.includes('Unexpected token') || msg.includes('is not valid JSON')
+          ? 'Received a non-JSON response from the server. Please check your image size or try again.'
+          : msg;
+
       setAnalysisError({
         code: 'NETWORK_ERROR',
-        message: msg,
+        message: cleanMsg,
       });
     } finally {
       setIsAnalyzing(false);
@@ -685,6 +757,10 @@ export default function ScannerPage() {
                     >
                       {analysisError.code === 'QUOTA_EXCEEDED'
                         ? 'Gemini Usage Limit Reached'
+                        : analysisError.code === 'PAYLOAD_TOO_LARGE'
+                        ? 'Image Transfer Limit Exceeded'
+                        : analysisError.code === 'TIMEOUT'
+                        ? 'Analysis Request Timed Out'
                         : analysisError.code === 'API_KEY_NOT_CONFIGURED'
                         ? 'AI API Setup Required'
                         : 'AI Classification Failed'}
@@ -692,6 +768,16 @@ export default function ScannerPage() {
                     {analysisError.code === 'QUOTA_EXCEEDED' && (
                       <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-200/80 text-amber-900 border border-amber-300/60">
                         HTTP 429
+                      </span>
+                    )}
+                    {analysisError.code === 'PAYLOAD_TOO_LARGE' && (
+                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-200 text-rose-900 border border-rose-300">
+                        HTTP 413
+                      </span>
+                    )}
+                    {analysisError.code === 'TIMEOUT' && (
+                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-200 text-rose-900 border border-rose-300">
+                        HTTP 504
                       </span>
                     )}
                   </div>
@@ -705,7 +791,29 @@ export default function ScannerPage() {
                 </div>
               </div>
 
-              {analysisError.code === 'QUOTA_EXCEEDED' ? (
+              {analysisError.code === 'PAYLOAD_TOO_LARGE' ? (
+                <div className="p-4 rounded-2xl bg-white border border-rose-200 text-xs space-y-3 text-slate-700">
+                  <div className="flex items-center justify-between border-b border-rose-100 pb-2">
+                    <span className="font-semibold text-slate-800">Transfer Ceiling:</span>
+                    <span className="font-mono text-rose-800 text-[11px] font-semibold">
+                      Vercel Serverless (4.5 MB Limit)
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Client-side auto-compression was applied, but the uncompressed camera raw file still exceeded the server transfer envelope. Try taking a photo at a slightly lower resolution or test with a sample item below.
+                  </p>
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={() => loadSampleItem(SAMPLE_WASTE_ITEMS[0])}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition-colors shadow-xs"
+                    >
+                      <Sparkles className="w-4 h-4 text-emerald-200" />
+                      <span>Test With Preset Sample Waste Item</span>
+                    </button>
+                  </div>
+                </div>
+              ) : analysisError.code === 'QUOTA_EXCEEDED' ? (
                 <div className="p-4 rounded-2xl bg-white border border-amber-200 text-xs space-y-3 text-slate-700">
                   <div className="flex items-center justify-between border-b border-amber-100 pb-2.5">
                     <span className="font-semibold text-slate-800">API Tier:</span>

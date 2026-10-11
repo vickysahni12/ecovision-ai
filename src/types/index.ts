@@ -65,7 +65,9 @@ export interface AnalysisApiResponse {
     | 'INVALID_IMAGE'
     | 'SERVER_ERROR'
     | 'QUOTA_EXCEEDED'
-    | 'AUTH_ERROR';
+    | 'AUTH_ERROR'
+    | 'PAYLOAD_TOO_LARGE'
+    | 'TIMEOUT';
   retryAfter?: number;
   retryHuman?: string;
 }
