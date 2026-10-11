@@ -1,0 +1,221 @@
+import { NextResponse } from 'next/server';
+import { GoogleGenAI } from '@google/genai';
+import { WasteAnalysisResult } from '@/types';
+
+export const maxDuration = 45; // 45 seconds max duration for multimodal vision inference
+
+// Models ordered by priority
+const CANDIDATE_MODELS = [
+  'gemini-flash-latest',
+  'gemini-3.8-flash',
+  'gemini-3.5-flash',
+  'gemini-2.5-flash-lite',
+];
+
+export async function POST(request: Request) {
+  try {
+    const authHeaderKey = request.headers.get('x-gemini-api-key');
+    const apiKey = (process.env.GEMINI_API_KEY || authHeaderKey || '').trim();
+
+    // 1. Strictly verify API Key presence
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: 'API_KEY_NOT_CONFIGURED',
+          error: 'Gemini API key is not configured.',
+          message:
+            'AI analysis cannot run because GEMINI_API_KEY is not set. Please add GEMINI_API_KEY to your .env.local file.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const body = await request.json();
+    const { image, mimeType = 'image/jpeg' } = body;
+
+    // 2. Validate input image
+    if (!image) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: 'INVALID_IMAGE',
+          error: 'No image provided.',
+          message: 'Please provide a valid image file or data URI to analyze.',
+        },
+        { status: 400 }
+      );
+    }
+
+    // Extract raw base64 data and clean MIME type
+    let base64Data = image;
+    let actualMimeType = mimeType;
+
+    if (image.startsWith('data:')) {
+      const parts = image.split(',');
+      const match = parts[0].match(/:(.*?);/);
+      if (match) actualMimeType = match[1];
+      base64Data = parts[1] || '';
+    }
+
+    if (!base64Data) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: 'INVALID_IMAGE',
+          error: 'Image data is empty.',
+          message: 'Unable to extract base64 image data from payload.',
+        },
+        { status: 400 }
+      );
+    }
+
+    // Initialize official Google GenAI SDK
+    const ai = new GoogleGenAI({ apiKey });
+
+    const prompt = `You are an expert environmental engineer and waste sorting vision system for EcoVision AI, built for the WeMakeDevs × AWS Environmental Hacks Hackathon (Track 03: Waste and Energy).
+Analyze the provided image of a waste or recyclable item.
+Identify the object, inspect material composition, resin codes (e.g. PET #1, HDPE #2), contamination indicators, and classify it into one of four standard waste categories:
+- "recyclable" (clean plastics, clean paper, cardboard cartons, aluminum/tin beverage and food cans, glass bottles/jars)
+- "organic" (food scraps, vegetable/fruit peelings, coffee grounds, compostable packaging)
+- "hazardous" (electronics, e-waste, lithium or alkaline batteries, lamps, CFL bulbs, chemicals, medical waste)
+- "landfill" (soiled items, grease-soaked paper, styrofoam/polystyrene, multi-layer foil pouches, chip bags, composite plastic wrappers)
+
+CRITICAL RULE 1 — FOOD WASTE VS EDIBLE FOOD AMBIGUITY:
+When the image alone is ambiguous and displays food that appears fresh, whole, intact, or potentially edible (such as a whole apple, uneaten bakery item, unopened packaged snack, or intact sandwich):
+- Do NOT prematurely treat it as discarded garbage!
+- In "itemName", clarify the item state (e.g., "Whole Red Apple (Edible Food / Not Waste)").
+- In "disposalSteps", list edible food preservation and donation FIRST:
+  1. "Prioritize eating while fresh or refrigerating/preserving leftovers."
+  2. "If wholesome, safe, and unconsumed, consider donating to a community fridge or food rescue organization."
+  3. "Only place in organic/compost stream if spoiled, contaminated, or inedible scraps."
+- In "notes", include a clear edibility advisory: "Edibility Advisory: Avoid wasting edible food. Prioritize human consumption, proper storage, or donation before considering composting."
+
+CRITICAL RULE 2 — SCIENTIFIC ESTIMATE INTEGRITY:
+- "carbonOffsetEstimate": Provide an approximate educational estimate benchmarked against EPA WARM and DEFRA diversion factors (e.g. "~0.32 kg CO₂e avoided"). Do NOT claim this is a certified laboratory Life Cycle Assessment (LCA).
+- "confidence": Provide an integer percentage between 70 and 99 reflecting model visual classification certainty.
+
+You MUST respond strictly with a valid JSON object matching this schema:
+{
+  "itemName": "string (clear specific name, e.g. PET Plastic Water Bottle)",
+  "category": "recyclable" | "organic" | "hazardous" | "landfill",
+  "categoryLabel": "string (e.g. Recyclable Plastics (PET #1))",
+  "confidence": number (integer between 70 and 99),
+  "material": "string (e.g. Polyethylene Terephthalate (PET))",
+  "recyclability": "High" | "Medium" | "Low" | "Non-recyclable",
+  "carbonOffsetEstimate": "string (e.g. ~0.32 kg CO₂e avoided)",
+  "disposalSteps": ["step 1", "step 2", "step 3"],
+  "preparationTips": ["tip 1 to avoid contamination", "tip 2"],
+  "upcyclingIdeas": ["creative circular reuse idea 1", "idea 2"],
+  "notes": "string (brief practical eco advice, edibility advisory if food, or municipal sorting note)"
+}`;
+
+    // Attempt generation across supported candidate models
+    let candidateText: string | null = null;
+    let modelUsed = '';
+    let lastError: Error | null = null;
+
+    for (const model of CANDIDATE_MODELS) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: actualMimeType,
+                    data: base64Data,
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+          },
+        });
+
+        if (response.text) {
+          candidateText = response.text;
+          modelUsed = model;
+          break;
+        }
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        console.warn(`Model ${model} failed, attempting fallback:`, lastError.message);
+      }
+    }
+
+    if (!candidateText) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: 'ANALYSIS_FAILED',
+          error: lastError?.message || 'Gemini models were unavailable.',
+          message:
+            'Google Gemini Multimodal Vision API failed to analyze the image. Please try again or check API key quota.',
+        },
+        { status: 502 }
+      );
+    }
+
+    // Clean JSON text if wrapped in markdown
+    let cleanJson = candidateText.trim();
+    if (cleanJson.startsWith('```json')) {
+      cleanJson = cleanJson.replace(/^```json/, '').replace(/```$/, '').trim();
+    } else if (cleanJson.startsWith('```')) {
+      cleanJson = cleanJson.replace(/^```/, '').replace(/```$/, '').trim();
+    }
+
+    const parsed = JSON.parse(cleanJson);
+
+    // Form final strongly-typed result with explicit live_ai indicators
+    const result: WasteAnalysisResult = {
+      id: `ai-scan-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      timestamp: new Date().toISOString(),
+      itemName: parsed.itemName || 'Identified Waste Item',
+      category: ['recyclable', 'organic', 'hazardous', 'landfill'].includes(parsed.category)
+        ? parsed.category
+        : 'landfill',
+      categoryLabel: parsed.categoryLabel || 'General Waste',
+      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 88,
+      material: parsed.material || 'Mixed Materials',
+      recyclability: parsed.recyclability || 'Medium',
+      carbonOffsetEstimate: parsed.carbonOffsetEstimate || '0.25 kg CO₂ saved',
+      disposalSteps: Array.isArray(parsed.disposalSteps) && parsed.disposalSteps.length > 0
+        ? parsed.disposalSteps
+        : ['Check local municipal disposal guidelines.'],
+      preparationTips: Array.isArray(parsed.preparationTips) && parsed.preparationTips.length > 0
+        ? parsed.preparationTips
+        : ['Ensure item is clean and dry before disposal.'],
+      upcyclingIdeas: Array.isArray(parsed.upcyclingIdeas) && parsed.upcyclingIdeas.length > 0
+        ? parsed.upcyclingIdeas
+        : ['Consider repurposing for storage or gardening.'],
+      imageUrl: image.startsWith('data:') ? image : undefined,
+      notes: parsed.notes,
+      scanType: 'live_ai',
+      isRealAiScan: true,
+      sourceModel: modelUsed,
+    };
+
+    return NextResponse.json({
+      success: true,
+      data: result,
+    });
+  } catch (error: unknown) {
+    const errorMsg = error instanceof Error ? error.message : 'Internal server error';
+    console.error('Error during waste analysis route:', error);
+    return NextResponse.json(
+      {
+        success: false,
+        code: 'SERVER_ERROR',
+        error: errorMsg,
+        message: 'An unexpected error occurred while communicating with Gemini Vision.',
+      },
+      { status: 500 }
+    );
+  }
+}
