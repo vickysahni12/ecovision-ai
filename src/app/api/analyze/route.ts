@@ -4,13 +4,133 @@ import { WasteAnalysisResult } from '@/types';
 
 export const maxDuration = 45; // 45 seconds max duration for multimodal vision inference
 
-// Models ordered by priority
-const CANDIDATE_MODELS = [
+// Officially supported models available to this project
+const SUPPORTED_MODELS = [
   'gemini-flash-latest',
   'gemini-3.8-flash',
-  'gemini-3.5-flash',
-  'gemini-2.5-flash-lite',
 ];
+
+export interface ParsedGeminiError {
+  isQuotaExceeded: boolean;
+  isAuthError: boolean;
+  isClientError: boolean;
+  retryAfterSeconds?: number;
+  retryHuman?: string;
+  rawMessage: string;
+}
+
+export function parseGeminiError(err: Error | unknown): ParsedGeminiError {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  let isQuotaExceeded = false;
+  let isAuthError = false;
+  let isClientError = false;
+  let retryAfterSeconds: number | undefined;
+  let retryHuman: string | undefined;
+
+  // 1. Try parsing JSON error structure from Google GenAI SDK
+  try {
+    const jsonMatch = errMsg.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const errorObj = parsed.error || parsed;
+      const code = Number(errorObj.code || errorObj.status);
+      const statusStr = String(errorObj.status || '');
+
+      if (
+        code === 429 ||
+        statusStr === 'RESOURCE_EXHAUSTED' ||
+        String(errorObj.message || '').includes('Quota exceeded')
+      ) {
+        isQuotaExceeded = true;
+      }
+
+      if (
+        code === 401 ||
+        code === 403 ||
+        statusStr === 'PERMISSION_DENIED' ||
+        statusStr === 'UNAUTHENTICATED'
+      ) {
+        isAuthError = true;
+      }
+
+      if (code === 400 || statusStr === 'INVALID_ARGUMENT') {
+        isClientError = true;
+      }
+
+      if (Array.isArray(errorObj.details)) {
+        for (const detail of errorObj.details) {
+          if (detail.retryDelay) {
+            const sec = parseInt(String(detail.retryDelay), 10);
+            if (!isNaN(sec) && sec > 0) {
+              retryAfterSeconds = sec;
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-JSON error message
+  }
+
+  // 2. String heuristics fallback
+  const lowerMsg = errMsg.toLowerCase();
+  if (!isQuotaExceeded) {
+    if (
+      lowerMsg.includes('429') ||
+      lowerMsg.includes('resource_exhausted') ||
+      lowerMsg.includes('exhausted') ||
+      lowerMsg.includes('quota') ||
+      lowerMsg.includes('rate_limit') ||
+      lowerMsg.includes('rate-limit') ||
+      lowerMsg.includes('free_tier_requests')
+    ) {
+      isQuotaExceeded = true;
+    }
+  }
+
+  if (!isAuthError) {
+    if (
+      lowerMsg.includes('api_key_invalid') ||
+      lowerMsg.includes('permission_denied') ||
+      lowerMsg.includes('unauthenticated') ||
+      lowerMsg.includes('403') ||
+      lowerMsg.includes('401')
+    ) {
+      isAuthError = true;
+    }
+  }
+
+  if (!isClientError && (lowerMsg.includes('invalid_argument') || lowerMsg.includes('400'))) {
+    isClientError = true;
+  }
+
+  // 3. Extract human retry text
+  const retryMatch = errMsg.match(/Please retry in\s+([0-9]+[hms0-9\.]+)/i);
+  if (retryMatch) {
+    retryHuman = retryMatch[1].replace(/\.$/, '');
+  }
+
+  // 4. Format retryHuman from retryAfterSeconds if not parsed from string
+  if (retryAfterSeconds && (!retryHuman || retryHuman.length > 25)) {
+    const hours = Math.floor(retryAfterSeconds / 3600);
+    const mins = Math.floor((retryAfterSeconds % 3600) / 60);
+    const secs = retryAfterSeconds % 60;
+    const parts: string[] = [];
+    if (hours > 0) parts.push(`${hours}h`);
+    if (mins > 0) parts.push(`${mins}m`);
+    if (secs > 0 && hours === 0) parts.push(`${secs}s`);
+    retryHuman = parts.join(' ') || `${retryAfterSeconds}s`;
+  }
+
+  return {
+    isQuotaExceeded,
+    isAuthError,
+    isClientError,
+    retryAfterSeconds,
+    retryHuman,
+    rawMessage: errMsg,
+  };
+}
 
 export async function POST(request: Request) {
   try {
@@ -112,12 +232,13 @@ You MUST respond strictly with a valid JSON object matching this schema:
   "notes": "string (brief practical eco advice, edibility advisory if food, or municipal sorting note)"
 }`;
 
-    // Attempt generation across supported candidate models
+    // Attempt generation across officially supported models
     let candidateText: string | null = null;
     let modelUsed = '';
     let lastError: Error | null = null;
+    let nonRecoverableError: ParsedGeminiError | null = null;
 
-    for (const model of CANDIDATE_MODELS) {
+    for (const model of SUPPORTED_MODELS) {
       try {
         const response = await ai.models.generateContent({
           model,
@@ -147,20 +268,79 @@ You MUST respond strictly with a valid JSON object matching this schema:
         }
       } catch (err: unknown) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        console.warn(`Model ${model} failed, attempting fallback:`, lastError.message);
+        const parsed = parseGeminiError(lastError);
+        console.warn(
+          `Model ${model} execution error:`,
+          parsed.isQuotaExceeded ? 'Quota Exceeded (HTTP 429)' : lastError.message
+        );
+
+        // Immediately STOP fallback attempts on quota exhaustion, auth failure, or invalid input
+        if (parsed.isQuotaExceeded || parsed.isAuthError || parsed.isClientError) {
+          nonRecoverableError = parsed;
+          break;
+        }
       }
     }
 
     if (!candidateText) {
+      const errorDetails = nonRecoverableError || (lastError ? parseGeminiError(lastError) : null);
+
+      // Return HTTP 429 if quota is exhausted
+      if (errorDetails?.isQuotaExceeded) {
+        const retrySec = errorDetails.retryAfterSeconds || 60;
+        const retryGuidance = errorDetails.retryHuman
+          ? `Expected reset in ~${errorDetails.retryHuman}.`
+          : 'Please wait before retrying.';
+
+        return NextResponse.json(
+          {
+            success: false,
+            code: 'QUOTA_EXCEEDED',
+            error: 'Google Gemini daily request quota reached.',
+            message: `Gemini API free-tier daily usage limit (20 requests/day) has been reached for this project. ${retryGuidance} You can continue testing by selecting a preset sample waste item.`,
+            retryAfter: retrySec,
+            retryHuman: errorDetails.retryHuman,
+          },
+          {
+            status: 429,
+            headers: {
+              'Retry-After': String(retrySec),
+              'Cache-Control': 'no-store, no-cache, must-revalidate',
+            },
+          }
+        );
+      }
+
+      // Return HTTP 401 if authentication failed
+      if (errorDetails?.isAuthError) {
+        return NextResponse.json(
+          {
+            success: false,
+            code: 'AUTH_ERROR',
+            error: 'Gemini API authentication failed.',
+            message:
+              'The configured GEMINI_API_KEY is invalid or lacks necessary permissions. Please check the key in Vercel Project Settings.',
+          },
+          {
+            status: 401,
+            headers: { 'Cache-Control': 'no-store' },
+          }
+        );
+      }
+
+      // Otherwise return HTTP 502 for actual model service failure
       return NextResponse.json(
         {
           success: false,
           code: 'ANALYSIS_FAILED',
           error: lastError?.message || 'Gemini models were unavailable.',
           message:
-            'Google Gemini Multimodal Vision API failed to analyze the image. Please try again or check API key quota.',
+            'Google Gemini Multimodal Vision API was unable to classify this image. Please try again with a clearer image.',
         },
-        { status: 502 }
+        {
+          status: 502,
+          headers: { 'Cache-Control': 'no-store' },
+        }
       );
     }
 

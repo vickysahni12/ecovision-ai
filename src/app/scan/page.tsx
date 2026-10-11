@@ -19,7 +19,8 @@ import {
   Check,
   BarChart3,
   ShieldCheck,
-  Cloud
+  Cloud,
+  Clock
 } from 'lucide-react';
 import { WasteAnalysisResult, ApiStatusResponse, AnalysisApiResponse, UploadApiResponse } from '@/types';
 import { saveScanRecord } from '@/lib/storage';
@@ -40,10 +41,28 @@ export default function ScannerPage() {
   
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<WasteAnalysisResult | null>(null);
-  const [analysisError, setAnalysisError] = useState<{ code: string; message: string } | null>(null);
+  const [analysisError, setAnalysisError] = useState<{
+    code: string;
+    message: string;
+    retryAfter?: number;
+    retryHuman?: string;
+  } | null>(null);
+  const [quotaCooldownSeconds, setQuotaCooldownSeconds] = useState<number | null>(null);
   const [savedToDashboard, setSavedToDashboard] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Active cooldown countdown timer for quota exhaustion (429)
+  useEffect(() => {
+    if (quotaCooldownSeconds === null || quotaCooldownSeconds <= 0) return;
+    const timer = setInterval(() => {
+      setQuotaCooldownSeconds((prev) => {
+        if (prev === null || prev <= 1) return null;
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [quotaCooldownSeconds]);
 
   const checkBackendApiStatus = useCallback(async () => {
     setCheckingApi(true);
@@ -168,7 +187,10 @@ export default function ScannerPage() {
 
   // Run Waste Analysis
   const handleAnalyze = async () => {
-    if (!selectedImage) return;
+    // Prevent duplicate submissions, concurrent runs, or attempts during active cooldown
+    if (!selectedImage || isAnalyzing || (quotaCooldownSeconds !== null && quotaCooldownSeconds > 0)) {
+      return;
+    }
 
     setIsAnalyzing(true);
     setAnalysisError(null);
@@ -191,10 +213,24 @@ export default function ScannerPage() {
       const responseData: AnalysisApiResponse = await res.json();
 
       if (!res.ok || !responseData.success) {
+        const is429 = res.status === 429 || responseData.code === 'QUOTA_EXCEEDED';
+        const errorCode = is429 ? 'QUOTA_EXCEEDED' : (responseData.code || 'ANALYSIS_FAILED');
+
         setAnalysisError({
-          code: responseData.code || 'ANALYSIS_FAILED',
-          message: responseData.message || responseData.error || 'Failed to analyze waste item.',
+          code: errorCode,
+          message:
+            responseData.message ||
+            responseData.error ||
+            (is429 ? 'Gemini API free-tier usage limit reached.' : 'Failed to analyze waste item.'),
+          retryAfter: responseData.retryAfter,
+          retryHuman: responseData.retryHuman,
         });
+
+        if (is429) {
+          // Set cooldown to prevent automatic or rapid repeated requests
+          const waitTime = Math.min(responseData.retryAfter || 60, 300);
+          setQuotaCooldownSeconds(waitTime);
+        }
       } else if (responseData.data) {
         setAnalysisResult(responseData.data);
       }
@@ -557,9 +593,9 @@ export default function ScannerPage() {
                 <button
                   type="button"
                   onClick={handleAnalyze}
-                  disabled={isAnalyzing}
+                  disabled={isAnalyzing || (quotaCooldownSeconds !== null && quotaCooldownSeconds > 0)}
                   className={`w-full flex items-center justify-center gap-2.5 py-4 rounded-xl text-base font-bold text-white transition-all duration-200 shadow-md ${
-                    isAnalyzing
+                    isAnalyzing || (quotaCooldownSeconds !== null && quotaCooldownSeconds > 0)
                       ? 'bg-slate-400 cursor-not-allowed'
                       : 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 shadow-emerald-600/20 hover:shadow-lg hover:shadow-emerald-600/30'
                   }`}
@@ -568,6 +604,11 @@ export default function ScannerPage() {
                     <>
                       <RefreshCw className="w-5 h-5 animate-spin text-white" />
                       <span>Classifying with Gemini Vision AI...</span>
+                    </>
+                  ) : quotaCooldownSeconds !== null && quotaCooldownSeconds > 0 ? (
+                    <>
+                      <Clock className="w-5 h-5 text-amber-100 animate-pulse" />
+                      <span>Quota Cooldown Active ({quotaCooldownSeconds}s)</span>
                     </>
                   ) : (
                     <>
@@ -612,26 +653,101 @@ export default function ScannerPage() {
 
         {/* Right Column: Result Card & States (5 cols) */}
         <div className="lg:col-span-5 space-y-6">
-          {/* State 1: Analysis Error or API Key Missing Message */}
+          {/* State 1: Analysis Error, Quota Exceeded, or API Key Missing */}
           {analysisError && (
-            <div className="rounded-3xl border border-rose-200 bg-rose-50/80 p-6 space-y-4 shadow-sm">
+            <div
+              className={`rounded-3xl border p-6 space-y-4 shadow-sm ${
+                analysisError.code === 'QUOTA_EXCEEDED'
+                  ? 'border-amber-300 bg-amber-50/90'
+                  : 'border-rose-200 bg-rose-50/80'
+              }`}
+            >
               <div className="flex items-start gap-3">
-                <div className="p-2 rounded-xl bg-rose-100 text-rose-700 shrink-0 mt-0.5">
-                  <AlertCircle className="w-5 h-5" />
+                <div
+                  className={`p-2 rounded-xl shrink-0 mt-0.5 ${
+                    analysisError.code === 'QUOTA_EXCEEDED'
+                      ? 'bg-amber-100 text-amber-800'
+                      : 'bg-rose-100 text-rose-700'
+                  }`}
+                >
+                  {analysisError.code === 'QUOTA_EXCEEDED' ? (
+                    <Clock className="w-5 h-5" />
+                  ) : (
+                    <AlertCircle className="w-5 h-5" />
+                  )}
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-rose-900">
-                    {analysisError.code === 'API_KEY_NOT_CONFIGURED'
-                      ? 'AI API Setup Required'
-                      : 'AI Classification Failed'}
-                  </h3>
-                  <p className="text-xs text-rose-700 mt-1 leading-relaxed">
+                  <div className="flex items-center gap-2">
+                    <h3
+                      className={`text-base font-bold ${
+                        analysisError.code === 'QUOTA_EXCEEDED' ? 'text-amber-900' : 'text-rose-900'
+                      }`}
+                    >
+                      {analysisError.code === 'QUOTA_EXCEEDED'
+                        ? 'Gemini Usage Limit Reached'
+                        : analysisError.code === 'API_KEY_NOT_CONFIGURED'
+                        ? 'AI API Setup Required'
+                        : 'AI Classification Failed'}
+                    </h3>
+                    {analysisError.code === 'QUOTA_EXCEEDED' && (
+                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-200/80 text-amber-900 border border-amber-300/60">
+                        HTTP 429
+                      </span>
+                    )}
+                  </div>
+                  <p
+                    className={`text-xs mt-1 leading-relaxed ${
+                      analysisError.code === 'QUOTA_EXCEEDED' ? 'text-amber-800' : 'text-rose-700'
+                    }`}
+                  >
                     {analysisError.message}
                   </p>
                 </div>
               </div>
 
-              {analysisError.code === 'API_KEY_NOT_CONFIGURED' ? (
+              {analysisError.code === 'QUOTA_EXCEEDED' ? (
+                <div className="p-4 rounded-2xl bg-white border border-amber-200 text-xs space-y-3 text-slate-700">
+                  <div className="flex items-center justify-between border-b border-amber-100 pb-2.5">
+                    <span className="font-semibold text-slate-800">API Tier:</span>
+                    <span className="font-mono text-amber-800 text-[11px] font-semibold">
+                      Google Gemini Free Tier (20 req/day)
+                    </span>
+                  </div>
+
+                  {analysisError.retryHuman && (
+                    <div className="flex items-center justify-between border-b border-amber-100 pb-2.5">
+                      <span className="font-semibold text-slate-800">Estimated Reset:</span>
+                      <span className="font-semibold text-amber-900">
+                        ~{analysisError.retryHuman}
+                      </span>
+                    </div>
+                  )}
+
+                  {quotaCooldownSeconds !== null && quotaCooldownSeconds > 0 && (
+                    <div className="flex items-center justify-between text-slate-600">
+                      <span>Request Cooldown:</span>
+                      <span className="font-mono text-amber-800 font-bold">
+                        {quotaCooldownSeconds}s remaining
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="p-2.5 rounded-xl bg-amber-50/60 border border-amber-200 text-[11px] text-amber-900 leading-relaxed">
+                    <strong>Hackathon Integrity:</strong> EcoVision AI adheres strictly to competition guidelines and never manufactures synthetic classifications when an API limit is reached.
+                  </div>
+
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={() => loadSampleItem(SAMPLE_WASTE_ITEMS[0])}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition-colors shadow-xs"
+                    >
+                      <Sparkles className="w-4 h-4 text-emerald-200" />
+                      <span>Test With Preset Sample Waste Item</span>
+                    </button>
+                  </div>
+                </div>
+              ) : analysisError.code === 'API_KEY_NOT_CONFIGURED' ? (
                 <div className="p-4 rounded-2xl bg-white border border-rose-200/80 text-xs space-y-3 text-slate-700">
                   <div className="font-semibold text-slate-900 flex items-center gap-1.5">
                     <Info className="w-4 h-4 text-emerald-600" />
@@ -641,9 +757,9 @@ export default function ScannerPage() {
                     <li>Get an API key from Google AI Studio.</li>
                     <li>
                       Add <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">GEMINI_API_KEY=your_key</code> in{' '}
-                      <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">.env.local</code>.
+                      <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">.env.local</code> or Vercel Project Settings.
                     </li>
-                    <li>Restart or apply a session key above.</li>
+                    <li>Redeploy or reload this page.</li>
                   </ol>
                   <p className="text-[11px] text-slate-500 italic">
                     Per hackathon guidelines, EcoVision AI never presents synthetic or falsified AI responses when an API is offline.
@@ -661,7 +777,11 @@ export default function ScannerPage() {
               <button
                 type="button"
                 onClick={() => setAnalysisError(null)}
-                className="w-full py-2.5 rounded-xl bg-white border border-rose-200 text-xs font-semibold text-rose-800 hover:bg-rose-100/50 transition-colors"
+                className={`w-full py-2.5 rounded-xl bg-white border text-xs font-semibold transition-colors ${
+                  analysisError.code === 'QUOTA_EXCEEDED'
+                    ? 'border-amber-300 text-amber-900 hover:bg-amber-100/50'
+                    : 'border-rose-200 text-rose-800 hover:bg-rose-100/50'
+                }`}
               >
                 Dismiss Notice
               </button>

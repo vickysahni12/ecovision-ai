@@ -59,7 +59,15 @@ export interface AnalysisApiResponse {
   data?: WasteAnalysisResult;
   error?: string;
   message?: string;
-  code?: 'API_KEY_NOT_CONFIGURED' | 'ANALYSIS_FAILED' | 'INVALID_IMAGE' | 'SERVER_ERROR';
+  code?:
+    | 'API_KEY_NOT_CONFIGURED'
+    | 'ANALYSIS_FAILED'
+    | 'INVALID_IMAGE'
+    | 'SERVER_ERROR'
+    | 'QUOTA_EXCEEDED'
+    | 'AUTH_ERROR';
+  retryAfter?: number;
+  retryHuman?: string;
 }
 
 export interface UploadApiResponse {
